@@ -19,7 +19,12 @@
  * with this program; if not, visit the http://fsf.org website.
  */
 
+#define XXH_STATIC_LINKING_ONLY   /* access advanced declarations */
+#define XXH_IMPLEMENTATION   /* access definitions */
+#include "xxhash.h"
+
 #include "rsync.h"
+
 
 extern int checksum_seed;
 extern int protocol_version;
@@ -32,6 +37,7 @@ extern char *checksum_choice;
 #define CSUM_MD4_OLD 3
 #define CSUM_MD4 4
 #define CSUM_MD5 5
+#define CSUM_XXHASH 6
 
 int xfersum_type = 0; /* used for the file transfer checksums */
 int checksum_type = 0; /* used for the pre-transfer (--checksum) checksums */
@@ -68,6 +74,8 @@ int parse_csum_name(const char *name, int len)
 		return CSUM_MD5;
 	if (len == 4 && strncasecmp(name, "none", 4) == 0)
 		return CSUM_NONE;
+	if (len == 6 && strncasecmp(name, "xxhash", 6) == 0)
+		return CSUM_XXHASH;
 
 	rprintf(FERROR, "unknown checksum name: %s\n", name);
 	exit_cleanup(RERR_UNSUPPORTED);
@@ -88,6 +96,8 @@ int csum_len_for_type(int cst, BOOL flist_csum)
 		return MD4_DIGEST_LEN;
 	  case CSUM_MD5:
 		return MD5_DIGEST_LEN;
+	  case CSUM_XXHASH:
+		return sizeof(XXH64_hash_t);
 	  default: /* paranoia to prevent missing case values */
 		exit_cleanup(RERR_UNSUPPORTED);
 	}
@@ -125,6 +135,10 @@ void get_checksum2(char *buf, int32 len, char *sum)
 	md_context m;
 
 	switch (xfersum_type) {
+          case CSUM_XXHASH: 
+		SIVAL64(sum, 0, XXH64(buf, len, checksum_seed));
+                break;
+
 	  case CSUM_MD5: {
 		uchar seedbuf[4];
 		md5_begin(&m);
@@ -196,6 +210,7 @@ void file_checksum(const char *fname, const STRUCT_STAT *st_p, char *sum)
 	md_context m;
 	int32 remainder;
 	int fd;
+	XXH64_state_t* state;
 
 	memset(sum, 0, MAX_DIGEST_LEN);
 
@@ -206,6 +221,31 @@ void file_checksum(const char *fname, const STRUCT_STAT *st_p, char *sum)
 	buf = map_file(fd, len, MAX_MAP_SIZE, CSUM_CHUNK);
 
 	switch (checksum_type) {
+          case CSUM_XXHASH:
+		state = XXH64_createState();
+		if (state==NULL) out_of_memory("file_checksum xx64");
+
+		unsigned long long const seed = 0;
+		if (XXH64_reset(state, seed) == XXH_ERROR) {
+		    rprintf(FERROR, "error resetting XXH64 seed");
+		    exit_cleanup(RERR_STREAMIO);
+		}
+
+		for (i = 0; i + CSUM_CHUNK <= len; i += CSUM_CHUNK) {
+		   XXH_errorcode const updateResult = XXH64_update(state, (uchar *)map_ptr(buf, i, CSUM_CHUNK), CSUM_CHUNK);
+		   if (updateResult == XXH_ERROR) {
+			rprintf(FERROR, "error computing XX64 hash");
+			exit_cleanup(RERR_STREAMIO);
+		   }
+		}
+		remainder = (int32)(len - i);
+                if (remainder > 0)
+			XXH64_update(state, (uchar *)map_ptr(buf, i, CSUM_CHUNK), remainder);
+		SIVAL64(sum, 0, XXH64_digest(state));
+
+		XXH64_freeState(state);
+
+		break;
 	  case CSUM_MD5:
 		md5_begin(&m);
 
@@ -252,6 +292,7 @@ void file_checksum(const char *fname, const STRUCT_STAT *st_p, char *sum)
 static int32 sumresidue;
 static md_context md;
 static int cursum_type;
+XXH64_state_t* xxh64_state = NULL;
 
 void sum_init(int csum_type, int seed)
 {
@@ -262,6 +303,16 @@ void sum_init(int csum_type, int seed)
 	cursum_type = csum_type;
 
 	switch (csum_type) {
+	  case CSUM_XXHASH:
+		if(xxh64_state == NULL) {
+		    xxh64_state = XXH64_createState();
+		    if (xxh64_state == NULL) out_of_memory("sum_init xxh64");
+		}
+		if (XXH64_reset(xxh64_state, 0) == XXH_ERROR) {
+		    rprintf(FERROR, "error resetting XXH64 state");
+		    exit_cleanup(RERR_STREAMIO);
+		}
+		break;
 	  case CSUM_MD5:
 		md5_begin(&md);
 		break;
@@ -295,6 +346,12 @@ void sum_init(int csum_type, int seed)
 void sum_update(const char *p, int32 len)
 {
 	switch (cursum_type) {
+	  case CSUM_XXHASH:
+		if (XXH64_update(xxh64_state, p, len) == XXH_ERROR) {
+		    rprintf(FERROR, "error computing XX64 hash");
+		    exit_cleanup(RERR_STREAMIO);
+		}
+		break;
 	  case CSUM_MD5:
 		md5_update(&md, (uchar *)p, len);
 		break;
@@ -340,6 +397,9 @@ void sum_update(const char *p, int32 len)
 int sum_end(char *sum)
 {
 	switch (cursum_type) {
+	  case CSUM_XXHASH:
+		SIVAL64(sum, 0, XXH64_digest(xxh64_state));
+		break;
 	  case CSUM_MD5:
 		md5_result(&md, (uchar *)sum);
 		break;
